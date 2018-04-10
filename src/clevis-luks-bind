@@ -23,7 +23,7 @@ SUMMARY="Binds a LUKSv1 device using the specified policy"
 UUID=cb6e8904-81ff-40da-a84a-07ab9ab5715e
 
 function onerr() {
-    if [ -n "$DEV" -a -n "$SLT" ]; then
+    if [ -n "$DEV" -a -n "$SLT" -a -z "$REBIND" ]; then
         luksmeta wipe -f -d "$DEV" -u "$UUID" -s "$SLT"
         SLT=
     fi
@@ -35,7 +35,7 @@ trap 'onerr' ERR HUP INT QUIT PIPE TERM
 
 function usage() {
     echo >&2
-    echo "Usage: clevis luks bind [-f] [-s SLT] [-k KEY] -d DEV PIN CFG" >&2
+    echo "Usage: clevis luks bind [-f] [-s SLT] [-k KEY] [-r] -d DEV PIN CFG" >&2
     echo >&2
     echo "$SUMMARY": >&2
     echo >&2
@@ -56,12 +56,13 @@ if [ $# -eq 1 -a "$1" == "--summary" ]; then
     exit 0
 fi
 
-while getopts ":hfd:s:k:" o; do
+while getopts ":hfd:s:k:r" o; do
     case "$o" in
     f) FRC=-f;;
     d) DEV=$OPTARG;;
     s) SLT=$OPTARG;;
     k) KEY=$OPTARG;;
+    r) REBIND=t;;
     *) usage;;
     esac
 done
@@ -93,12 +94,31 @@ if [ -n "$KEY" ]; then
     fi
 fi
 
-# Generate a key with the same entropy as the LUKS Master Key
-dump=`cryptsetup luksDump $DEV`
-bits=`sed -r -n 's|MK bits:[ \t]*([0-9]+)|\1|p' <<< "$dump"`
-key=`pwmake $bits`
+if [ -z "$REBIND" ]; then
+   # Generate a key with the same entropy as the LUKS Master Key, ...
+   dump=`cryptsetup luksDump $DEV`
+   bits=`sed -r -n 's|MK bits:[ \t]*([0-9]+)|\1|p' <<< "$dump"`
+   key=`pwmake $bits`
+else
+    if [ -z "$SLT" ]; then
+        while read slot state uuid; do
+            if [ "$state" == "active" -a "$uuid" == "$UUID" ]; then
+                SLT=$slot
+                break
+            fi
+        done <<<$(luksmeta show -d "$DEV")
+        if [ -z "$SLT" ]; then
+            echo "No active clevis slot found!" >&2
+            exit 1
+        fi
+    elif [ "$(luksmeta show -d "$DEV" -s "$SLT")" != "$UUID" ]; then
+        echo "Slot $SLT is not a clevis slot!" >&2
+        exit 1
+    fi
+    key=$(luksmeta load -d "$DEV" -s "$SLT" -u "$UUID" | clevis decrypt)
+fi
 
-# Encrypt the new key
+# Encrypt the key
 jwe=`echo -n "$key" | clevis encrypt "$PIN" "$CFG"`
 
 # If necessary, initialize the LUKS volume
@@ -108,6 +128,11 @@ fi
 
 # Write the JWE into the specified slot. Or, if no slot is given, ...
 if [ -n "$SLT" ]; then
+    # XXX - if the wipe is done but the save fails or is never done,
+    #       we have potentially destroyed data.
+    if [ -n "$REBIND" ]; then
+        luksmeta wipe -d "$DEV" -u "$UUID" -s $SLT -f
+    fi
     if ! echo -n $jwe | luksmeta save -d "$DEV" -u "$UUID" -s $SLT 2>/dev/null; then
         echo "Error while saving Clevis metadata in LUKS header!" >&2
         false
@@ -119,14 +144,16 @@ elif ! SLT=`echo -n $jwe | luksmeta save -d "$DEV" -u "$UUID" 2>/dev/null`; then
     false
 fi
 
-export DEV
-export SLT
+if [ -z "$REBIND" ]; then
+    export DEV
+    export SLT
 
-# Add the new key to the LUKS slot that matches the LUKSMeta slot
-case "$KEY" in
-"") read -s -p "Enter existing LUKS password: " old; echo;;
- -) old=`cat`;;
- *) old=`cat "$KEY"`;;
-esac
+    # Add the new key to the LUKS slot that matches the LUKSMeta slot
+    case "$KEY" in
+        "") read -s -p "Enter existing LUKS password: " old; echo;;
+        -) old=`cat`;;
+        *) old=`cat "$KEY"`;;
+    esac
 
-echo -e "$old\n$key" | cryptsetup luksAddKey -S $SLT $DEV
+    echo -e "$old\n$key" | cryptsetup luksAddKey -S $SLT $DEV
+fi
